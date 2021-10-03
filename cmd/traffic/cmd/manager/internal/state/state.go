@@ -20,6 +20,7 @@ import (
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
 	"github.com/telepresenceio/telepresence/v2/pkg/iputil"
 	"github.com/telepresenceio/telepresence/v2/pkg/log"
+	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
 type SessionState interface {
@@ -27,16 +28,97 @@ type SessionState interface {
 	Done() <-chan struct{}
 	LastMarked() time.Time
 	SetLastMarked(lastMarked time.Time)
+	Dials() <-chan *rpc.DialRequest
+	EstablishBidiPipe(context.Context, tunnel.Stream) (tunnel.Endpoint, error)
+	OnConnect(context.Context, tunnel.Stream) (tunnel.Endpoint, error)
+}
+
+type awaitingBidiPipe struct {
+	stream     tunnel.Stream
+	bidiPipeCh chan tunnel.Endpoint
 }
 
 type sessionState struct {
-	done       <-chan struct{}
-	cancel     context.CancelFunc
-	lastMarked time.Time
+	sync.Mutex
+	done                <-chan struct{}
+	cancel              context.CancelFunc
+	lastMarked          time.Time
+	awaitingBidiPipeMap map[tunnel.ConnID]*awaitingBidiPipe
+	dials               chan *rpc.DialRequest
+}
+
+// EstablishBidiPipe registers the given stream as waiting for a matching stream to arrive in a call
+// to Tunnel, sends a DialRequest to the owner of this sessionState, and then waits. When the call
+// arrives, a BidiPipe connecting the two streams is returned.
+func (ss *sessionState) EstablishBidiPipe(ctx context.Context, stream tunnel.Stream) (tunnel.Endpoint, error) {
+	// Dispatch directly to agent and let the dial happen there
+	bidiPipeCh := make(chan tunnel.Endpoint)
+	id := stream.ID()
+	abp := &awaitingBidiPipe{stream: stream, bidiPipeCh: bidiPipeCh}
+
+	ss.Lock()
+	if ss.awaitingBidiPipeMap == nil {
+		ss.awaitingBidiPipeMap = map[tunnel.ConnID]*awaitingBidiPipe{id: abp}
+	} else {
+		ss.awaitingBidiPipeMap[id] = abp
+	}
+	ss.Unlock()
+
+	// Send dial request to the client/agent
+	select {
+	case <-ss.done:
+		return nil, status.Error(codes.Canceled, "session cancelled")
+	case ss.dials <- &rpc.DialRequest{ConnId: []byte(id), RoundtripLatency: int64(stream.RoundtripLatency()), DialTimeout: int64(stream.DialTimeout())}:
+	}
+
+	// Wait for the client/agent to connect. Allow extra time for the call
+	ctx, cancel := context.WithTimeout(ctx, stream.DialTimeout()+stream.RoundtripLatency())
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return nil, status.Error(codes.DeadlineExceeded, "timeout while establishing bidipipe")
+	case <-ss.done:
+		return nil, status.Error(codes.Canceled, "session cancelled")
+	case bidi := <-bidiPipeCh:
+		return bidi, nil
+	}
+}
+
+// OnConnect checks if a stream is waiting for the given stream to arrive in order to create a BidiPipe.
+// If that's the case, the BidiPipe is created, started, and returned by both this method and the EstablishBidiPipe
+// method that registered the waiting stream. Otherwise this method returns nil.
+func (ss *sessionState) OnConnect(ctx context.Context, stream tunnel.Stream) (tunnel.Endpoint, error) {
+	id := stream.ID()
+	ss.Lock()
+	abp, ok := ss.awaitingBidiPipeMap[id]
+	if ok {
+		delete(ss.awaitingBidiPipeMap, id)
+	}
+	ss.Unlock()
+
+	if !ok {
+		return nil, nil
+	}
+	dlog.Debugf(ctx, "   FWD %s, connect session %s with %s", id, abp.stream.SessionID(), stream.SessionID())
+	bidiPipe := tunnel.NewBidiPipe(abp.stream, stream)
+	bidiPipe.Start(ctx)
+
+	defer close(abp.bidiPipeCh)
+	select {
+	case <-ss.done:
+		return nil, status.Error(codes.Canceled, "session cancelled")
+	case abp.bidiPipeCh <- bidiPipe:
+		return bidiPipe, nil
+	}
 }
 
 func (ss *sessionState) Cancel() {
 	ss.cancel()
+	close(ss.dials)
+}
+
+func (ss *sessionState) Dials() <-chan *rpc.DialRequest {
+	return ss.dials
 }
 
 func (ss *sessionState) Done() <-chan struct{} {
@@ -54,40 +136,39 @@ func (ss *sessionState) SetLastMarked(lastMarked time.Time) {
 type agentTunnel struct {
 	name      string
 	namespace string
-	tunnel    connpool.Tunnel
+	muxTunnel connpool.MuxTunnel
 }
 
 type clientSessionState struct {
 	sessionState
-	name           string
-	pool           *connpool.Pool
-	tunnel         connpool.Tunnel
-	agentTunnelsMu sync.Mutex
-	agentTunnels   map[string]*agentTunnel
+	name         string
+	pool         *tunnel.Pool
+	muxTunnel    connpool.MuxTunnel
+	agentTunnels map[string]*agentTunnel
 }
 
-func (cs *clientSessionState) addAgentTunnel(agentSessionID, name, namespace string, tunnel connpool.Tunnel) {
-	cs.agentTunnelsMu.Lock()
+func (cs *clientSessionState) addAgentTunnel(agentSessionID, name, namespace string, muxTunnel connpool.MuxTunnel) {
+	cs.Lock()
 	cs.agentTunnels[agentSessionID] = &agentTunnel{
 		name:      name,
 		namespace: namespace,
-		tunnel:    tunnel,
+		muxTunnel: muxTunnel,
 	}
-	cs.agentTunnelsMu.Unlock()
+	cs.Unlock()
 }
 
 func (cs *clientSessionState) deleteAgentTunnel(agentSessionID string) {
-	cs.agentTunnelsMu.Lock()
+	cs.Lock()
 	delete(cs.agentTunnels, agentSessionID)
-	cs.agentTunnelsMu.Unlock()
+	cs.Unlock()
 }
 
-// getRandomAgentTunnel will return the tunnel of an intercepted agent provided all intercepted
+// getRandomAgentTunnel will return the muxTunnel of an intercepted agent provided all intercepted
 // agents live in the same namespace. The method will return nil if the client currently has no
 // intercepts or if it has several intercepts that span more than one namespace.
 func (cs *clientSessionState) getRandomAgentTunnel() (tunnel *agentTunnel) {
-	cs.agentTunnelsMu.Lock()
-	defer cs.agentTunnelsMu.Unlock()
+	cs.Lock()
+	defer cs.Unlock()
 	prevNs := ""
 	for _, agentTunnel := range cs.agentTunnels {
 		tunnel = agentTunnel
@@ -100,20 +181,6 @@ func (cs *clientSessionState) getRandomAgentTunnel() (tunnel *agentTunnel) {
 	// return the first tunnel found. In case there are several, the map will
 	// randomize which one
 	return tunnel
-}
-
-// getInterceptedAgents returns the session ID of each agent currently intercepted
-// by this client
-func (cs *clientSessionState) getInterceptedAgents() []string {
-	cs.agentTunnelsMu.Lock()
-	agentSessionIDs := make([]string, len(cs.agentTunnels))
-	i := 0
-	for agentSession := range cs.agentTunnels {
-		agentSessionIDs[i] = agentSession
-		i++
-	}
-	cs.agentTunnelsMu.Unlock()
-	return agentSessionIDs
 }
 
 type agentSessionState struct {
@@ -262,9 +329,10 @@ func (s *State) MarkSession(req *rpc.RemainRequest, now time.Time) (ok bool) {
 }
 
 // RemoveSession removes a session from the set of present session IDs.
-func (s *State) RemoveSession(sessionID string) {
+func (s *State) RemoveSession(ctx context.Context, sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	dlog.Debugf(ctx, "Session %s removed. Explicit removal", sessionID)
 
 	s.unlockedRemoveSession(sessionID)
 }
@@ -315,12 +383,13 @@ func (s *State) unlockedRemoveSession(sessionID string) {
 
 // ExpireSessions prunes any sessions that haven't had a MarkSession heartbeat since the given
 // 'moment'.
-func (s *State) ExpireSessions(moment time.Time) {
+func (s *State) ExpireSessions(ctx context.Context, moment time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for id, sess := range s.sessions {
 		if sess.LastMarked().Before(moment) {
+			dlog.Debugf(ctx, "Session %s removed. It has expired", id)
 			s.unlockedRemoveSession(id)
 		}
 	}
@@ -366,9 +435,10 @@ func (s *State) addClient(sessionID string, client *rpc.ClientInfo, now time.Tim
 			done:       ctx.Done(),
 			cancel:     cancel,
 			lastMarked: now,
+			dials:      make(chan *rpc.DialRequest),
 		},
 		name:         client.Name,
-		pool:         connpool.NewPool(),
+		pool:         tunnel.NewPool(),
 		agentTunnels: make(map[string]*agentTunnel),
 	}
 	return sessionID
@@ -416,6 +486,7 @@ func (s *State) AddAgent(agent *rpc.AgentInfo, now time.Time) string {
 			done:       ctx.Done(),
 			cancel:     cancel,
 			lastMarked: now,
+			dials:      make(chan *rpc.DialRequest),
 		},
 		lookups:         make(chan *rpc.LookupHostRequest),
 		lookupResponses: make(map[string]chan *rpc.LookupHostResponse),
@@ -511,16 +582,34 @@ func (s *State) AddIntercept(sessionID, apiKey string, spec *rpc.InterceptSpec) 
 	return cept, nil
 }
 
-// getAgentsInterceptedByClient returns the session IDs for each agent that is currently
+// getAgentsInterceptedByClient returns the session IDs for each agent that are currently
 // intercepted by the client with the given client session ID.
-func (s *State) getAgentsInterceptedByClient(clientSessionID string) ([]string, error) {
-	s.mu.Lock()
-	ss := s.sessions[clientSessionID]
-	s.mu.Unlock()
-	if cs, ok := ss.(*clientSessionState); ok {
-		return cs.getInterceptedAgents(), nil
+func (s *State) getAgentsInterceptedByClient(clientSessionID string) []string {
+	intercepts := s.intercepts.LoadAllMatching(func(_ string, ii *rpc.InterceptInfo) bool {
+		return ii.ClientSession.SessionId == clientSessionID
+	})
+	if len(intercepts) == 0 {
+		return nil
 	}
-	return nil, status.Errorf(codes.NotFound, "Client session %q not found", clientSessionID)
+	agents := s.agents.LoadAllMatching(func(_ string, ai *rpc.AgentInfo) bool {
+		for _, ii := range intercepts {
+			if ai.Name == ii.Spec.Agent && ai.Namespace == ii.Spec.Namespace {
+				return true
+			}
+		}
+		return false
+	})
+	if len(agents) == 0 {
+		return nil
+	}
+
+	agentIDs := make([]string, len(agents)) // At least one agent per intercept
+	i := 0
+	for id := range agents {
+		agentIDs[i] = id
+		i++
+	}
+	return agentIDs
 }
 
 // UpdateIntercept applies a given mutator function to the stored intercept with interceptID;
@@ -538,13 +627,13 @@ func (s *State) UpdateIntercept(interceptID string, apply func(*rpc.InterceptInf
 			return nil
 		}
 
-		new := proto.Clone(cur).(*rpc.InterceptInfo)
-		apply(new)
+		newInfo := proto.Clone(cur).(*rpc.InterceptInfo)
+		apply(newInfo)
 
-		swapped := s.intercepts.CompareAndSwap(new.Id, cur, new)
+		swapped := s.intercepts.CompareAndSwap(newInfo.Id, cur, newInfo)
 		if swapped {
 			// Success!
-			return new
+			return newInfo
 		}
 	}
 }
@@ -608,7 +697,7 @@ func (s *State) WatchIntercepts(
 	}
 }
 
-func (s *State) ClientTunnel(ctx context.Context, tunnel connpool.Tunnel) error {
+func (s *State) ClientTunnel(ctx context.Context, muxTunnel connpool.MuxTunnel) error {
 	sessionID := managerutil.GetSessionID(ctx)
 	s.mu.Lock()
 	ss := s.sessions[sessionID]
@@ -619,9 +708,9 @@ func (s *State) ClientTunnel(ctx context.Context, tunnel connpool.Tunnel) error 
 	}
 	dlog.Debug(ctx, "Established TCP tunnel")
 	pool := cs.pool // must have one pool per client
-	cs.tunnel = tunnel
+	cs.muxTunnel = muxTunnel
 	defer pool.CloseAll(ctx)
-	msgCh, errCh := tunnel.ReadLoop(ctx)
+	msgCh, errCh := muxTunnel.ReadLoop(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -634,7 +723,7 @@ func (s *State) ClientTunnel(ctx context.Context, tunnel connpool.Tunnel) error 
 			}
 
 			id := msg.ID()
-			var handler connpool.Handler
+			var handler tunnel.Handler
 			if ctrl, ok := msg.(connpool.Control); ok {
 				switch ctrl.Code() {
 				// Don't establish a conn-forward or dialer just to say goodbye
@@ -648,37 +737,115 @@ func (s *State) ClientTunnel(ctx context.Context, tunnel connpool.Tunnel) error 
 			if handler == nil {
 				// Retrieve the connection that is tracked for the given id. Create a new one if necessary
 				var err error
-				handler, _, err = pool.GetOrCreate(ctx, id, func(ctx context.Context, release func()) (connpool.Handler, error) {
+				handler, _, err = pool.GetOrCreate(ctx, id, func(ctx context.Context, release func()) (tunnel.Handler, error) {
 					if agentTunnel := cs.getRandomAgentTunnel(); agentTunnel != nil {
 						// Dispatch directly to agent and let the dial happen there
 						dlog.Debugf(ctx, "|| FRWD %s forwarding client connection to agent %s.%s", id, agentTunnel.name, agentTunnel.namespace)
-						return newConnForward(release, agentTunnel.tunnel), nil
+						return newTunnelForward(release, agentTunnel.muxTunnel), nil
 					}
-					return connpool.NewDialer(id, cs.tunnel, release), nil
+					return connpool.NewDialer(id, cs.muxTunnel, release), nil
 				})
 				if err != nil {
 					return fmt.Errorf("failed to get connection handler: %w", err)
 				}
 			}
-			handler.HandleMessage(ctx, msg)
+			handler.(connpool.Handler).HandleMessage(ctx, msg)
 		}
 	}
 }
 
-type connForward struct {
+func (s *State) Tunnel(ctx context.Context, stream tunnel.Stream) error {
+	sessionID := stream.SessionID()
+	s.mu.Lock()
+	ss, ok := s.sessions[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return status.Errorf(codes.NotFound, "Session %q not found", sessionID)
+	}
+
+	bidiPipe, err := ss.OnConnect(ctx, stream)
+	if err != nil {
+		return err
+	}
+
+	if bidiPipe != nil {
+		// A peer awaited this stream. Wait for the bidiPipe to finish
+		<-bidiPipe.Done()
+		return nil
+	}
+
+	// The session is either the telepresence client or a traffic-agent.
+	//
+	// A client will want to extend the tunnel to a dialer in an intercepted traffic-agent or, if no
+	// intercept is active, to a dialer here in the traffic-agent.
+	//
+	// A traffic-agent must always extend the tunnel to the client that it is currently intercepted
+	// by, and hence, start by sending the sessionID of that client on the tunnel.
+	var peerSession SessionState
+	if _, ok := ss.(*agentSessionState); ok {
+		// traffic-agent, so obtain the desired client session
+		m, err := stream.Receive(ctx)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "failed to read first message from agent tunnel %q: %v", sessionID, err)
+		}
+		if m.Code() != tunnel.Session {
+			return status.Errorf(codes.FailedPrecondition, "unable to read ClientSession from agent %q", sessionID)
+		}
+		peerID := tunnel.GetSession(m)
+		s.mu.Lock()
+		peerSession = s.sessions[peerID]
+		s.mu.Unlock()
+	} else {
+		peerSession = s.getRandomAgentSession(sessionID)
+	}
+
+	var endPoint tunnel.Endpoint
+	if peerSession != nil {
+		var err error
+		if endPoint, err = peerSession.EstablishBidiPipe(ctx, stream); err != nil {
+			return err
+		}
+	} else {
+		endPoint = tunnel.NewDialer(stream)
+		endPoint.Start(ctx)
+	}
+	<-endPoint.Done()
+	return nil
+}
+
+func (s *State) getRandomAgentSession(clientSessionID string) (agent SessionState) {
+	if agentIDs := s.getAgentsInterceptedByClient(clientSessionID); len(agentIDs) > 0 {
+		s.mu.Lock()
+		agent = s.sessions[agentIDs[0]]
+		s.mu.Unlock()
+	}
+	return
+}
+
+func (s *State) WatchDial(sessionID string) <-chan *rpc.DialRequest {
+	s.mu.Lock()
+	ss, ok := s.sessions[sessionID]
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return ss.Dials()
+}
+
+type tunnelForward struct {
 	release  func()
-	toStream connpool.Tunnel
+	toStream connpool.MuxTunnel
 }
 
-func newConnForward(release func(), toStream connpool.Tunnel) *connForward {
-	return &connForward{release: release, toStream: toStream}
+func newTunnelForward(release func(), toStream connpool.MuxTunnel) *tunnelForward {
+	return &tunnelForward{release: release, toStream: toStream}
 }
 
-func (cf *connForward) Close(_ context.Context) {
+func (cf *tunnelForward) Close(_ context.Context) {
 	cf.release()
 }
 
-func (cf *connForward) HandleMessage(ctx context.Context, msg connpool.Message) {
+func (cf *tunnelForward) HandleMessage(ctx context.Context, msg connpool.Message) {
 	dlog.Debugf(ctx, ">> FRWD %s to agent", msg.ID())
 	if err := cf.toStream.Send(ctx, msg); err != nil {
 		dlog.Errorf(ctx, "!! FRWD %s to agent, send failed: %v", msg.ID(), err)
@@ -693,10 +860,11 @@ func (cf *connForward) HandleMessage(ctx context.Context, msg connpool.Message) 
 	}
 }
 
-func (cf *connForward) Start(_ context.Context) {
+func (cf *tunnelForward) Start(_ context.Context) error {
+	return nil
 }
 
-func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionInfo, tunnel connpool.Tunnel) error {
+func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionInfo, muxTunnel connpool.MuxTunnel) error {
 	agentSessionID := managerutil.GetSessionID(ctx)
 	as, cs, err := func() (*agentSessionState, *clientSessionState, error) {
 		s.mu.Lock()
@@ -721,11 +889,11 @@ func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionI
 
 	// During intercept, all requests that are made to this pool, are forwarded to the intercepted
 	// agent(s)
-	cs.addAgentTunnel(agentSessionID, as.agent.Name, as.agent.Namespace, tunnel)
+	cs.addAgentTunnel(agentSessionID, as.agent.Name, as.agent.Namespace, muxTunnel)
 	defer cs.deleteAgentTunnel(agentSessionID)
 
 	pool := cs.pool
-	msgCh, errCh := tunnel.ReadLoop(ctx)
+	msgCh, errCh := muxTunnel.ReadLoop(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -746,8 +914,8 @@ func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionI
 			}
 			if ensureForward {
 				// Ensure that a forward tunnel exists that the client can use for responses
-				_, _, err = pool.GetOrCreate(ctx, msg.ID(), func(ctx context.Context, release func()) (connpool.Handler, error) {
-					return newConnForward(release, tunnel), nil
+				_, _, err = pool.GetOrCreate(ctx, msg.ID(), func(ctx context.Context, release func()) (tunnel.Handler, error) {
+					return newTunnelForward(release, muxTunnel), nil
 				})
 				if err != nil {
 					dlog.Error(ctx, err)
@@ -755,7 +923,7 @@ func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionI
 				}
 			}
 			dlog.Debugf(ctx, ">> FRWD %s to client", msg.ID())
-			if err = cs.tunnel.Send(ctx, msg); err != nil {
+			if err = cs.muxTunnel.Send(ctx, msg); err != nil {
 				dlog.Errorf(ctx, "Send to client failed: %v", err)
 				return err
 			}
@@ -767,11 +935,7 @@ func (s *State) AgentTunnel(ctx context.Context, clientSessionInfo *rpc.SessionI
 // the clientSessionID, it will then wait for results to arrive, collect those results, and return them as a
 // unique and sorted slice together with a count of how many agents that replied.
 func (s *State) AgentsLookup(ctx context.Context, clientSessionID string, request *rpc.LookupHostRequest) (iputil.IPs, int, error) {
-	iceptAgentIDs, err := s.getAgentsInterceptedByClient(clientSessionID)
-	if err != nil {
-		return nil, 0, err
-	}
-
+	iceptAgentIDs := s.getAgentsInterceptedByClient(clientSessionID)
 	ips := iputil.IPs{}
 	iceptCount := len(iceptAgentIDs)
 	if iceptCount == 0 {

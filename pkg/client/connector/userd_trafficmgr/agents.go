@@ -2,7 +2,9 @@ package userd_trafficmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -12,6 +14,7 @@ import (
 	rpc "github.com/telepresenceio/telepresence/rpc/v2/connector"
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
 	"github.com/telepresenceio/telepresence/v2/pkg/client"
+	"github.com/telepresenceio/telepresence/v2/pkg/tunnel"
 )
 
 // getCurrentAgents returns a copy of the current agent snapshot
@@ -59,23 +62,26 @@ func (tm *trafficManager) agentInfoWatcher(ctx context.Context) error {
 			err = fmt.Errorf("manager.WatchAgents dial: %w", err)
 		}
 		for err == nil && ctx.Err() == nil {
-			if snapshot, err := stream.Recv(); err != nil {
+			snapshot, err := stream.Recv()
+			if err != nil {
 				if ctx.Err() == nil {
-					dlog.Errorf(ctx, "manager.WatchAgents recv: %v", err)
-					break
+					if !errors.Is(err, io.EOF) {
+						dlog.Errorf(ctx, "manager.WatchAgents recv: %v", err)
+					}
 				}
-			} else {
-				tm.setCurrentAgents(snapshot.Agents)
+				tm.setCurrentAgents(nil)
+				break
+			}
+			tm.setCurrentAgents(snapshot.Agents)
 
-				// Notify waiters for agents
-				for _, agent := range snapshot.Agents {
-					fullName := agent.Name + "." + agent.Namespace
-					if chUt, loaded := tm.agentWaiters.LoadAndDelete(fullName); loaded {
-						if ch, ok := chUt.(chan *manager.AgentInfo); ok {
-							dlog.Debugf(ctx, "wait status: agent %s arrived", fullName)
-							ch <- agent
-							close(ch)
-						}
+			// Notify waiters for agents
+			for _, agent := range snapshot.Agents {
+				fullName := agent.Name + "." + agent.Namespace
+				if chUt, loaded := tm.agentWaiters.LoadAndDelete(fullName); loaded {
+					if ch, ok := chUt.(chan *manager.AgentInfo); ok {
+						dlog.Debugf(ctx, "wait status: agent %s arrived", fullName)
+						ch <- agent
+						close(ch)
 					}
 				}
 			}
@@ -87,6 +93,17 @@ func (tm *trafficManager) agentInfoWatcher(ctx context.Context) error {
 			backoff = 3 * time.Second
 		}
 	}
+	return nil
+}
+
+func (tm *trafficManager) dialRequestWatcher(ctx context.Context) error {
+	<-tm.startup
+	// Deal with dial requests from the manager
+	dialerStream, err := tm.managerClient.WatchDial(ctx, tm.sessionInfo)
+	if err != nil {
+		return err
+	}
+	tunnel.DialWaitLoop(ctx, tm.managerClient, dialerStream, tm.sessionInfo.SessionId)
 	return nil
 }
 
