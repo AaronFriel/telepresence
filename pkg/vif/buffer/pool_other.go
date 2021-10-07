@@ -3,6 +3,8 @@
 
 package buffer
 
+import "sync"
+
 type Data struct {
 	buf []byte
 }
@@ -32,11 +34,9 @@ func (b *Data) Raw() []byte {
 }
 
 var DataPool = &Pool{
-	/*
-		pool: sync.Pool{
-			New: func() interface{} {
-				return &Data{buf: make([]byte, defaultMTU+maxIPHeader)}
-			}},
-	*/
+	pool: sync.Pool{
+		New: func() interface{} {
+			return &Data{buf: make([]byte, defaultMTU+maxIPHeader)}
+		}},
 	MTU: defaultMTU,
 }

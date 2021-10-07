@@ -12,8 +12,7 @@ type Pool struct {
 }
 
 func (p *Pool) Get(size int) *Data {
-	b := &Data{buf: make([]byte, defaultMTU+maxIPHeader)}
-	// b := p.pool.Get().(*Data)
+	b := p.pool.Get().(*Data)
 	b.SetLength(size)
 	return b
 }
