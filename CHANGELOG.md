@@ -8,6 +8,8 @@
 
 - Feature: The `gather-logs` command added two new flags. One for anonymizing pod names + namespaces and the other for getting the pod yaml of the `traffic-manager` and any pod that contains a `traffic-agent`.
 
+- Feature: When using `--docker-run`, volumes are mounted directly to the correct paths, obviating the need to use `$TELEPRESENCE_ROOT` and enabling Telepresence to work with containers that use volume mounts without modifying application code.
+
 - Bugfix: Telepresence will now log that the kubernetes server version is unsupported when using a version older than 1.17.
 
 ### 2.4.4 (September 27, 2021)
