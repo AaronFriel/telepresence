@@ -1,10 +1,7 @@
 package tunnel
 
 import (
-	"bytes"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"net"
 
@@ -49,32 +46,6 @@ func NewZeroID() ConnID {
 // IsIPv4 returns true if the source and destination of this ConnID are IPv4
 func (id ConnID) IsIPv4() bool {
 	return len(id) == 13
-}
-
-func (id ConnID) MarshalJSON() ([]byte, error) {
-	w := &bytes.Buffer{}
-	w.WriteByte('"')
-	enc := base64.NewEncoder(base64.StdEncoding, w)
-	_, err := enc.Write([]byte(id))
-	_ = enc.Close()
-	if err != nil {
-		return nil, err
-	}
-	w.WriteByte('"')
-	return w.Bytes(), nil
-}
-
-func (id *ConnID) UnmarshalJSON(data []byte) error {
-	var s string
-	err := json.Unmarshal(data, &s)
-	if err != nil {
-		return err
-	}
-	bs, err := base64.StdEncoding.DecodeString(s)
-	if err == nil {
-		*id = ConnID(bs)
-	}
-	return err
 }
 
 // Source returns the source IP

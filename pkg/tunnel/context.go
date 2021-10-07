@@ -1,8 +1,6 @@
 package tunnel
 
-import (
-	"context"
-)
+import "context"
 
 type poolKey struct{}
 
