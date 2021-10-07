@@ -129,8 +129,6 @@ type stream struct {
 	roundtripLatency time.Duration
 	sessionID        string
 	tag              string
-	counter          uint32
-	lastAck          uint32
 	syncRatio        uint32 // send and check sync after each syncRatio message
 	ackWindow        uint32 // maximum permitted difference between sent and received ack
 	peerVersion      uint16

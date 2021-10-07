@@ -1,12 +1,14 @@
 package buffer
 
+import "sync"
+
 const defaultMTU = 1500
 const maxIPHeader = 40
 
 // A Pool is a specialized sync.Pool for Data. The Data struct is platform specific
 type Pool struct {
-	//	pool sync.Pool
-	MTU int
+	pool sync.Pool
+	MTU  int
 }
 
 func (p *Pool) Get(size int) *Data {
@@ -17,5 +19,5 @@ func (p *Pool) Get(size int) *Data {
 }
 
 func (p *Pool) Put(b *Data) {
-	// p.pool.Put(b)
+	p.pool.Put(b)
 }

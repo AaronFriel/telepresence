@@ -175,6 +175,67 @@ func (p *mgrProxy) AgentTunnel(server managerrpc.Manager_AgentTunnelServer) erro
 	return errors.New("must call manager.AgentTunnel from an agent (intercepted Pod), not from a client (workstation)")
 }
 
+type tmReceiver interface {
+	Recv() (*managerrpc.TunnelMessage, error)
+}
+
+type tmSender interface {
+	Send(*managerrpc.TunnelMessage) error
+}
+
+func recvLoop(ctx context.Context, who string, in tmReceiver, out chan<- *managerrpc.TunnelMessage, wg *sync.WaitGroup) {
+	defer func() {
+		dlog.Debugf(ctx, "%s Recv loop ended", who)
+		wg.Done()
+	}()
+	dlog.Debugf(ctx, "%s Recv loop started", who)
+	for {
+		payload, err := in.Recv()
+		if err != nil {
+			if ctx.Err() == nil && !(errors.Is(io.EOF, err) || errors.Is(net.ErrClosed, err)) {
+				dlog.Errorf(ctx, "Tunnel %s.Recv() failed: %v", who, err)
+			}
+			return
+		}
+		dlog.Tracef(ctx, "<- %s %d", who, len(payload.Payload))
+		select {
+		case <-ctx.Done():
+			return
+		case out <- payload:
+		}
+	}
+}
+
+func sendLoop(ctx context.Context, who string, out tmSender, in <-chan *managerrpc.TunnelMessage, wg *sync.WaitGroup) {
+	defer func() {
+		dlog.Debugf(ctx, "%s Send loop ended", who)
+		wg.Done()
+	}()
+	dlog.Debugf(ctx, "%s Send loop started", who)
+	if outC, ok := out.(interface{ CloseSend() error }); ok {
+		defer func() {
+			if err := outC.CloseSend(); err != nil {
+				dlog.Errorf(ctx, "CloseSend() failed: %v", err)
+			}
+		}()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload := <-in:
+			if payload == nil {
+				return
+			}
+			if err := out.Send(payload); err != nil && !errors.Is(net.ErrClosed, err) {
+				dlog.Errorf(ctx, "Tunnel %s.Send() failed: %v", who, err)
+				return
+			}
+			dlog.Tracef(ctx, "-> %s %d", who, len(payload.Payload))
+		}
+	}
+}
+
 func (p *mgrProxy) Tunnel(fhClient managerrpc.Manager_TunnelServer) error {
 	ctx := fhClient.Context()
 	fhManager, err := p.client.Tunnel(ctx, p.callOptions...)
@@ -183,101 +244,13 @@ func (p *mgrProxy) Tunnel(fhClient managerrpc.Manager_TunnelServer) error {
 	}
 	mgrToClient := make(chan *managerrpc.TunnelMessage)
 	clientToMgr := make(chan *managerrpc.TunnelMessage)
+
 	wg := sync.WaitGroup{}
 	wg.Add(4)
-	go func() {
-		defer func() {
-			dlog.Debug(ctx, "manager Recv loop ended")
-			wg.Done()
-		}()
-		dlog.Debug(ctx, "manager Recv loop started")
-		for {
-			payload, err := fhManager.Recv()
-			if err != nil {
-				if ctx.Err() == nil && !(errors.Is(io.EOF, err) || errors.Is(net.ErrClosed, err)) {
-					dlog.Errorf(ctx, "Tunnel manager.Recv() failed: %v", err)
-				}
-				return
-			}
-			dlog.Tracef(ctx, "<- manager %d", len(payload.Payload))
-			select {
-			case <-ctx.Done():
-				return
-			case mgrToClient <- payload:
-			}
-		}
-	}()
-	go func() {
-		defer func() {
-			dlog.Debug(ctx, "manager Send loop ended")
-			wg.Done()
-		}()
-		dlog.Debug(ctx, "manager Send loop started")
-		defer func() {
-			if err := fhManager.CloseSend(); err != nil {
-				dlog.Errorf(ctx, "CloseSend() failed: %v", err)
-			}
-		}()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case payload := <-clientToMgr:
-				if payload == nil {
-					return
-				}
-				if err := fhManager.Send(payload); err != nil && !errors.Is(net.ErrClosed, err) {
-					dlog.Errorf(ctx, "Tunnel manager.Send() failed: %v", err)
-					return
-				}
-				dlog.Tracef(ctx, "-> manager %d", len(payload.Payload))
-			}
-		}
-	}()
-	go func() {
-		defer func() {
-			dlog.Debug(ctx, "client Recv loop ended")
-			wg.Done()
-		}()
-		dlog.Debug(ctx, "client Recv loop started")
-		for {
-			payload, err := fhClient.Recv()
-			if err != nil {
-				if ctx.Err() == nil && !(errors.Is(io.EOF, err) || errors.Is(net.ErrClosed, err)) {
-					dlog.Errorf(ctx, "Tunnel client.Recv() failed: %v", err)
-				}
-				return
-			}
-			dlog.Tracef(ctx, "<- client %d", len(payload.Payload))
-			select {
-			case <-ctx.Done():
-				return
-			case clientToMgr <- payload:
-			}
-		}
-	}()
-	go func() {
-		defer func() {
-			dlog.Debug(ctx, "client Send loop ended")
-			wg.Done()
-		}()
-		dlog.Debug(ctx, "client Send loop started")
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case payload := <-mgrToClient:
-				if payload == nil {
-					return
-				}
-				if err := fhClient.Send(payload); err != nil && !errors.Is(net.ErrClosed, err) {
-					dlog.Errorf(ctx, "Tunnel client.Send() failed: %v", err)
-					return
-				}
-				dlog.Tracef(ctx, "-> client %d", len(payload.Payload))
-			}
-		}
-	}()
+	go recvLoop(ctx, "manager", fhManager, mgrToClient, &wg)
+	go sendLoop(ctx, "manager", fhManager, clientToMgr, &wg)
+	go recvLoop(ctx, "client", fhClient, clientToMgr, &wg)
+	go sendLoop(ctx, "client", fhClient, mgrToClient, &wg)
 	wg.Wait()
 	return nil
 }

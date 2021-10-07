@@ -22,8 +22,6 @@ const (
 	KeepAlive
 	Session
 	closeSend
-	syncRequest
-	syncResponse
 )
 
 func (c MessageCode) String() string {
@@ -126,26 +124,10 @@ func GetSession(m Message) string {
 	return string(m.Payload())
 }
 
-func SyncRequestControl(ackNbr uint32) Message {
-	m := makeMessage(syncRequest, 4)
-	n := binary.PutUvarint(m.Payload(), uint64(ackNbr))
-	return m[:n+1]
-}
-
-func SyncResponseControl(request Message) Message {
-	return NewMessage(syncResponse, request.Payload())
-}
-
 func makeMessage(code MessageCode, payloadLength int) msg {
 	m := make(msg, 1+payloadLength)
 	m[0] = byte(code)
 	return m
-}
-
-// getAckNumber returns the AckNumber that this Message represents
-func getAckNumber(m Message) uint32 {
-	v, _ := binary.Uvarint(m.Payload())
-	return uint32(v)
 }
 
 // getVersion returns the version that this Message represents

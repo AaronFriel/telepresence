@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/datawire/dlib/derror"
-
 	"github.com/datawire/dlib/dlog"
 	"github.com/telepresenceio/telepresence/v2/pkg/connpool"
 	"github.com/telepresenceio/telepresence/v2/pkg/ipproto"
@@ -86,18 +85,6 @@ type PacketHandler interface {
 }
 
 type StreamCreator func(ctx context.Context) (tunnel.Stream, error)
-
-type ackWait struct {
-	ts      int64
-	resends int
-}
-
-type packetInfo struct {
-	ts  int64
-	seq uint32
-	ack uint32
-	len int
-}
 
 type handler struct {
 	streamCreator StreamCreator
@@ -467,7 +454,9 @@ func (h *handler) idle(ctx context.Context, syn Packet) quitReason {
 		return quitByReset
 	}
 	if !tcpHdr.SYN() {
-		h.toTun.Write(ctx, syn.Reset())
+		if err := h.toTun.Write(ctx, syn.Reset()); err != nil {
+			dlog.Errorf(ctx, "!! CON %s, send of RST failed: %v", h.id, err)
+		}
 		syn.Release()
 		return quitByUs
 	}
@@ -475,7 +464,9 @@ func (h *handler) idle(ctx context.Context, syn Packet) quitReason {
 	synOpts, err := options(tcpHdr)
 	if err != nil {
 		dlog.Error(ctx, err)
-		h.toTun.Write(ctx, syn.Reset())
+		if err := h.toTun.Write(ctx, syn.Reset()); err != nil {
+			dlog.Errorf(ctx, "!! CON %s, send of RST failed: %v", h.id, err)
+		}
 		syn.Release()
 		return quitByUs
 	}
@@ -509,7 +500,9 @@ func (h *handler) idle(ctx context.Context, syn Packet) quitReason {
 	}
 	if err != nil {
 		dlog.Error(ctx, err)
-		h.toTun.Write(ctx, syn.Reset())
+		if err := h.toTun.Write(ctx, syn.Reset()); err != nil {
+			dlog.Errorf(ctx, "!! CON %s, send of RST failed: %v", h.id, err)
+		}
 		return quitByUs
 	}
 	return pleaseContinue
@@ -671,7 +664,7 @@ func (h *handler) processPackets(ctx context.Context) {
 		if h.stream != nil {
 			go func() {
 				if err := h.stream.CloseSend(ctx); err != nil {
-					dlog.Errorf(ctx, "!! CON %s CloseSend() failed %v", h.id)
+					dlog.Errorf(ctx, "!! CON %s CloseSend() failed %v", h.id, err)
 				}
 			}()
 		}
