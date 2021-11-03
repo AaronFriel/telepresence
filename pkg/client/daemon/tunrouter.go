@@ -458,11 +458,11 @@ func (t *tunRouter) handlePacket(c context.Context, data *buffer.Data) {
 func (t *tunRouter) tcp(c context.Context, pkt tcp.Packet) {
 	ipHdr := pkt.IPHeader()
 	tcpHdr := pkt.Header()
-	if tcpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
-		// Ignore TCP packages intended for the DNS resolver for now
-		// TODO: Add support to DNS over TCP. The github.com/miekg/dns can do that.
-		return
-	}
+	// if tcpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
+	// 	// Ignore TCP packages intended for the DNS resolver for now
+	// 	// TODO: Add support to DNS over TCP. The github.com/miekg/dns can do that.
+	// 	return
+	// }
 
 	connID := connpool.NewConnID(ipproto.TCP, ipHdr.Source(), ipHdr.Destination(), tcpHdr.SourcePort(), tcpHdr.DestinationPort())
 	wf, _, err := t.handlers.GetOrCreate(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
@@ -480,9 +480,9 @@ func (t *tunRouter) udp(c context.Context, dg udp.Datagram) {
 	udpHdr := dg.Header()
 	connID := connpool.NewConnID(ipproto.UDP, ipHdr.Source(), ipHdr.Destination(), udpHdr.SourcePort(), udpHdr.DestinationPort())
 	uh, _, err := t.handlers.GetOrCreate(c, connID, func(c context.Context, remove func()) (connpool.Handler, error) {
-		if t.dnsLocalAddr != nil && udpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
-			return udp.NewDnsInterceptor(t.tunnel, t.toTunCh, connID, remove, t.dnsLocalAddr)
-		}
+		// if t.dnsLocalAddr != nil && udpHdr.DestinationPort() == t.dnsPort && ipHdr.Destination().Equal(t.dnsIP) {
+		// 	return udp.NewDnsInterceptor(t.tunnel, t.toTunCh, connID, remove, t.dnsLocalAddr)
+		// }
 		return udp.NewHandler(t.tunnel, t.toTunCh, connID, remove), nil
 	})
 	if err != nil {
